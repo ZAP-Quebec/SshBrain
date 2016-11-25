@@ -13,7 +13,7 @@ import (
 type SshServer struct {
 	m              sync.Mutex
 	config         *ssh.ServerConfig
-	clients        map[string]string
+	clients        map[string]*SshConnection
 	clientsUpdates chan *SshConnection
 	services       map[uint32]func(*SshConnection, net.Conn)
 }
@@ -21,20 +21,25 @@ type SshServer struct {
 type ConnectionFactory func() (net.Conn, error)
 type ServiceCallback func(*SshConnection, net.Conn)
 
-func NewServer(key string) *SshServer {
+func NewServer(keyPath string, adminKeys []string) *SshServer {
 	config := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 
 			log.Printf("Server: %s User: %s\n", string(conn.ClientVersion()), conn.User())
 			pubkey := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
 			log.Printf("PubKey: %s\n", pubkey)
+
+			if conn.User() == "root" && !isAdminKey(pubkey, adminKeys) {
+				return nil, fmt.Errorf("Not authorized")
+			}
+
 			return &ssh.Permissions{Extensions: map[string]string{
 				"key-id": pubkey,
 			}}, nil
 		},
 	}
 
-	privateBytes, err := ioutil.ReadFile(key)
+	privateBytes, err := ioutil.ReadFile(keyPath)
 	if err != nil {
 		panic("Fail to load private key")
 	}
@@ -46,13 +51,22 @@ func NewServer(key string) *SshServer {
 
 	server := &SshServer{
 		config:         config,
-		clients:        make(map[string]string),
+		clients:        make(map[string]*SshConnection),
 		clientsUpdates: make(chan *SshConnection, 10),
 		services:       make(map[uint32]func(*SshConnection, net.Conn)),
 	}
 
 	go server.manageServerStates()
 	return server
+}
+
+func isAdminKey(key string, adminKeys []string) bool {
+	for _, adminKey := range adminKeys {
+		if adminKey == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SshServer) Listen(address string) {
@@ -120,8 +134,18 @@ func (s *SshServer) handleServiceRequest(port uint32, client *SshConnection, bui
 	return nil
 }
 
+func (s *SshServer) ListClients() []*SshConnection {
+	clients := make([]*SshConnection, 0, len(s.clients))
+
+	for _, client := range s.clients {
+		clients = append(clients, client)
+	}
+
+	return clients
+}
+
 func (s *SshServer) manageServerStates() {
-	for _ = range s.clientsUpdates {
-		//
+	for client := range s.clientsUpdates {
+		s.clients[client.RemoteAddr()] = client
 	}
 }

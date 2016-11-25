@@ -14,6 +14,7 @@ type SshError int
 const (
 	ErrParsing SshError = iota
 	ErrAddr
+	ErrUnauthorized
 )
 
 type SshConnection struct {
@@ -34,7 +35,7 @@ func NewConnection(server *SshServer, conn *ssh.ServerConn, chans <-chan ssh.New
 		chans:    chans,
 		reqs:     reqs,
 		openAddr: make(map[string]bool),
-		log:      log.New(os.Stderr, conn.RemoteAddr().String(), log.LstdFlags|log.LUTC|log.Llongfile),
+		log:      log.New(os.Stderr, conn.RemoteAddr().String()+"\t", log.LstdFlags|log.LUTC|log.Lshortfile),
 		lPort:    32768,
 	}
 }
@@ -51,19 +52,17 @@ func (s *SshConnection) PublicKey() string {
 	}
 }
 
-func (s *SshConnection) Dial(address string) (net.Conn, error) {
+func (s *SshConnection) Dial(address string, port uint32) (net.Conn, error) {
 	s.m.Lock()
 	defer s.m.Unlock()
 
 	req := &DirectTcpipOpenRequest{
 		OriginatorIPAddress: "127.0.0.1",
 		OriginatorPort:      s.lPort,
+		HostToConnect:       address,
+		PortToConnect:       port,
 	}
 	s.lPort++
-
-	if _, err := fmt.Sscanf(address, "%s:%d", &req.HostToConnect, &req.PortToConnect); err != nil {
-		return nil, err
-	}
 
 	msg := ssh.Marshal(req)
 
@@ -141,15 +140,6 @@ func (s *SshConnection) handleMainRequest(req *ssh.Request) {
 			req.Reply(true, nil)
 		}
 	}
-	//ch.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
-
-	// reqData := &TcpIpForwardRequest{}
-	// if err := ssh.Unmarshal(req.Payload, reqData); err != nil {
-	// 	log.Printf("Error parsing tcpip-forward request: %s\n", err)
-	// } else {
-	// 	log.Printf("tcpip-forward %v\n", reqData)
-	// }
-
 }
 
 func (s *SshConnection) handleNewChannel(newChan ssh.NewChannel) {
@@ -162,6 +152,12 @@ func (s *SshConnection) handleNewChannel(newChan ssh.NewChannel) {
 			if err := s.createServiceConnection(newChan, reqData); err != nil {
 				s.rejectNewChannelWithError(newChan, ssh.ConnectionFailed, ErrAddr, err)
 			}
+		}
+	} else if channelType == "session" {
+		if s.conn.User() != "root" {
+			s.rejectNewChannelWithError(newChan, ssh.Prohibited, ErrUnauthorized, fmt.Errorf("Session refused for user %s", s.conn.User()))
+		} else {
+			s.startSession(newChan)
 		}
 	}
 }
@@ -188,6 +184,15 @@ func (s *SshConnection) createServiceConnection(newChan ssh.NewChannel, reqData 
 		return conn, nil
 	})
 	return nil
+}
+
+func (s *SshConnection) startSession(newChan ssh.NewChannel) {
+	channel, reqs, err := newChan.Accept()
+	if err != nil {
+		s.log.Println("Error accepting session: ", err)
+	} else {
+		go NewTerminal(s.server, channel, reqs).Start()
+	}
 }
 
 func (s *SshConnection) rejectNewChannelWithError(newChan ssh.NewChannel, reason ssh.RejectionReason, code SshError, err error) {
