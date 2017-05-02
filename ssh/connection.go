@@ -102,6 +102,8 @@ func (s *SshConnection) ListOpenAddr() []string {
 }
 
 func (s *SshConnection) handleConnection() {
+	addr := s.RemoteAddr()
+	defer s.log.Printf("Deconnected from %s\n", addr)
 	for {
 		select {
 		case req, ok := <-s.reqs:
@@ -157,8 +159,11 @@ func (s *SshConnection) handleNewChannel(newChan ssh.NewChannel) {
 		if s.conn.User() != "root" {
 			s.rejectNewChannelWithError(newChan, ssh.Prohibited, ErrUnauthorized, fmt.Errorf("Session refused for user %s", s.conn.User()))
 		} else {
-			s.startSession(newChan)
+			go s.startSession(newChan)
 		}
+	} else {
+		s.log.Printf("Received channel request `%s`", channelType)
+		s.rejectNewChannelWithError(newChan, ssh.Prohibited, ErrUnauthorized, fmt.Errorf("Unknown channel type %s", channelType))
 	}
 }
 
@@ -187,12 +192,85 @@ func (s *SshConnection) createServiceConnection(newChan ssh.NewChannel, reqData 
 }
 
 func (s *SshConnection) startSession(newChan ssh.NewChannel) {
+	s.log.Println("Starting session")
 	channel, reqs, err := newChan.Accept()
 	if err != nil {
 		s.log.Println("Error accepting session: ", err)
-	} else {
-		go NewTerminal(s.server, channel, reqs).Start()
+		return
 	}
+	defer channel.Close()
+
+	var isShell bool
+	var cmd struct {
+		Line string
+	}
+	savedReqs := make([]*ssh.Request, 0)
+ReqLoop:
+	for req := range reqs {
+		switch req.Type {
+		case "pty-req":
+			savedReqs = append(savedReqs, req)
+		case "shell", "exec":
+			if req.Type == "shell" {
+				isShell = true
+			} else if err := ssh.Unmarshal(req.Payload, &cmd); err != nil {
+				s.log.Printf("Error parsing command: %s\r\n", err)
+				if req.WantReply {
+					req.Reply(false, []byte(err.Error()))
+				}
+				return
+			}
+			defer func() {
+				log.Println("fucking defer!!!!")
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+			}()
+			break ReqLoop
+		default:
+			s.log.Printf("Unknown req %s(%v) %v\r\n", req.Type, req.Payload, req.WantReply)
+			if req.WantReply {
+				req.Reply(false, []byte("Unknown request type"))
+			}
+		}
+	}
+
+	// TODO close newReqs
+	newReqs := make(chan *ssh.Request)
+
+	go func() {
+		for _, req := range savedReqs {
+			newReqs <- req
+		}
+
+		for req := range reqs {
+			newReqs <- req
+		}
+	}()
+
+	if isShell {
+		s.startShell(channel, newReqs)
+	} else {
+		var exit struct {
+			Code int
+		}
+		exit.Code = s.execCmd(channel, newReqs, cmd.Line)
+		channel.SendRequest("exit-status", false, ssh.Marshal(exit))
+	}
+}
+
+func (s *SshConnection) startShell(channel ssh.Channel, reqs <-chan *ssh.Request) {
+	NewTerminal(s.server, channel, reqs).Start()
+}
+
+func (s *SshConnection) execCmd(channel ssh.Channel, reqs <-chan *ssh.Request, cmd string) int {
+	ctx := CmdContext{
+		channel,
+		s.log,
+		s.server,
+		nil,
+	}
+	return commands.Exec(ctx, cmd)
 }
 
 func (s *SshConnection) rejectNewChannelWithError(newChan ssh.NewChannel, reason ssh.RejectionReason, code SshError, err error) {

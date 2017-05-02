@@ -2,23 +2,40 @@ package ssh
 
 import (
 	"fmt"
-	"golang.org/x/crypto/ssh"
 	"net"
+	"strings"
 )
 
-type PtyRequest struct {
-	TermEnv    string        // TERM environment variable value (e.g., vt100)
-	CharWidth  uint32        // terminal width, characters (e.g., 80)
-	CharHeight uint32        // terminal height, rows (e.g., 24)
-	PxWidth    uint32        // terminal width, pixels (e.g., 640)
-	PxHeight   uint32        // terminal height, pixels (e.g., 480)
-	TermModes  TerminalModes // encoded terminal modes
+type Arguments []string
+
+func (args Arguments) Where(filter func(string) bool) Arguments {
+	res := make(Arguments, 0)
+	for _, arg := range args {
+		if filter(arg) {
+			res = append(res, arg)
+		}
+	}
+	return res
 }
 
-type TerminalModes string
+func (args Arguments) First(filter func(string) bool) (string, error) {
+	res := args.Where(filter)
+	if len(res) == 0 {
+		return "", fmt.Errorf("No argument matching filter")
+	}
+	return res[0], nil
+}
 
-func (m TerminalModes) Parse() ssh.TerminalModes {
-	return make(map[uint8]uint32)
+func (args Arguments) Single(filter func(string) bool) (string, error) {
+	res := args.Where(filter)
+	if len(res) != 1 {
+		return "", fmt.Errorf("None or more than one argument matching filter")
+	}
+	return res[0], nil
+}
+
+func (args Arguments) String() string {
+	return strings.Join(args, " ")
 }
 
 type DirectTcpipOpenRequest struct {

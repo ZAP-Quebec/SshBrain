@@ -2,20 +2,20 @@ package ssh
 
 import (
 	"fmt"
+	"github.com/JeanSebTr/SshBrain/actor"
+	"github.com/JeanSebTr/SshBrain/domain"
 	"golang.org/x/crypto/ssh"
 	"io/ioutil"
 	"log"
 	"net"
 	"strings"
-	"sync"
 )
 
 type SshServer struct {
-	m              sync.Mutex
-	config         *ssh.ServerConfig
-	clients        map[string]*SshConnection
-	clientsUpdates chan *SshConnection
-	services       map[uint32]func(*SshConnection, net.Conn)
+	a        *actor.Actor
+	config   *ssh.ServerConfig
+	clients  map[string]*Node
+	services map[uint32]func(*SshConnection, net.Conn)
 }
 
 type ConnectionFactory func() (net.Conn, error)
@@ -50,13 +50,12 @@ func NewServer(keyPath string, adminKeys []string) *SshServer {
 	config.AddHostKey(private)
 
 	server := &SshServer{
-		config:         config,
-		clients:        make(map[string]*SshConnection),
-		clientsUpdates: make(chan *SshConnection, 10),
-		services:       make(map[uint32]func(*SshConnection, net.Conn)),
+		a:        actor.NewActor(),
+		config:   config,
+		clients:  make(map[string]*Node),
+		services: make(map[uint32]func(*SshConnection, net.Conn)),
 	}
 
-	go server.manageServerStates()
 	return server
 }
 
@@ -90,9 +89,6 @@ func (s *SshServer) Listen(address string) {
 }
 
 func (s *SshServer) ExposeService(port uint32, handler func(*SshConnection, net.Conn)) {
-	s.m.Lock()
-	defer s.m.Unlock()
-
 	if _, exists := s.services[port]; exists {
 		panic(fmt.Errorf("Port %d is already exposed", port))
 	}
@@ -109,15 +105,17 @@ func (s *SshServer) handleClient(conn net.Conn) {
 
 	client := NewConnection(s, sConn, chans, reqs)
 
-	s.clientsUpdates <- client
+	if client.User() != "root" {
+		s.a.Post(func() {
+			mac := strings.ToUpper(client.User())
+			s.clients[mac] = NewNode(client)
+		})
+	}
 
 	go client.handleConnection()
 }
 
 func (s *SshServer) handleServiceRequest(port uint32, client *SshConnection, builder ConnectionFactory) error {
-	s.m.Lock()
-	defer s.m.Unlock()
-
 	var (
 		handler ServiceCallback
 		exists  bool
@@ -134,18 +132,25 @@ func (s *SshServer) handleServiceRequest(port uint32, client *SshConnection, bui
 	return nil
 }
 
-func (s *SshServer) ListClients() []*SshConnection {
-	clients := make([]*SshConnection, 0, len(s.clients))
-
-	for _, client := range s.clients {
-		clients = append(clients, client)
-	}
-
-	return clients
+func (s *SshServer) Count() int {
+	return len(s.clients)
 }
 
-func (s *SshServer) manageServerStates() {
-	for client := range s.clientsUpdates {
-		s.clients[client.RemoteAddr()] = client
+func (s *SshServer) GetAll() []domain.Node {
+	nodes := make([]domain.Node, 0, len(s.clients))
+
+	for _, node := range s.clients {
+		nodes = append(nodes, node)
+	}
+
+	return nodes
+}
+
+func (s *SshServer) GetById(id string) (domain.Node, error) {
+	mac := strings.ToUpper(id)
+	if node, ok := s.clients[mac]; ok {
+		return node, nil
+	} else {
+		return nil, nil
 	}
 }
